@@ -4287,7 +4287,8 @@ impl Canvas {
             // Draw the transformed paste image via GPU mesh, clipped to canvas bounds
             // so pasted images larger than the canvas don't extend beyond it.
             let clipped_painter = painter.with_clip_rect(image_rect);
-            overlay.draw_gpu(&clipped_painter, image_rect, self.zoom);
+            let layer_opacity = state.layers.get(state.active_layer_index).map_or(1.0, |l| l.opacity);
+            overlay.draw_gpu(&clipped_painter, image_rect, self.zoom, layer_opacity);
 
             // If there are visible layers above the active layer, composite them
             // and overlay on top of the paste so those layers render correctly.

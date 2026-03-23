@@ -633,7 +633,7 @@ impl PasteOverlay {
 
     /// Draw the paste overlay image using GPU-accelerated textured mesh.
     /// The GPU handles rotation and translation — no per-pixel CPU work needed.
-    pub fn draw_gpu(&self, painter: &egui::Painter, image_rect: Rect, zoom: f32) {
+    pub fn draw_gpu(&self, painter: &egui::Painter, image_rect: Rect, zoom: f32, opacity: f32) {
         let tex = match &self.gpu_texture {
             Some(t) => t,
             None => return,
@@ -647,7 +647,8 @@ impl PasteOverlay {
         let s_br = self.canvas_to_screen(corners[3], image_rect, zoom);
 
         // Build a textured quad (two triangles).
-        let white = Color32::WHITE;
+        // Vertex color multiplies with the texture, so modulate alpha for layer opacity.
+        let white = Color32::from_white_alpha((opacity.clamp(0.0, 1.0) * 255.0) as u8);
         let mut mesh = egui::Mesh::with_texture(tex.id());
 
         // Vertices: TL, TR, BL, BR  with UV corners
