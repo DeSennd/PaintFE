@@ -3083,6 +3083,9 @@ pub struct AppSettings {
     pub confirm_on_exit: bool,
     /// Apply the active layer's opacity to the paste/selection overlay preview.
     pub overlay_respects_layer_opacity: bool,
+    /// Maximum stem characters shown in a project tab before truncating with "…".
+    /// 0 = never truncate. Range: 8–128.
+    pub tab_name_max_chars: u32,
 
     // --- Advanced Customization (Phase 10) ---
     /// Master toggle — when false, all overrides are ignored.
@@ -3164,6 +3167,7 @@ impl Default for AppSettings {
 
             confirm_on_exit: true,
             overlay_respects_layer_opacity: true,
+            tab_name_max_chars: 24,
 
             // Advanced Customization defaults
             advanced_customization: false,
@@ -3609,7 +3613,8 @@ impl AppSettings {
              default_canvas_height={}\n\
              create_canvas_on_startup={}\n\
              confirm_on_exit={}\n\
-             overlay_respects_layer_opacity={}\n",
+             overlay_respects_layer_opacity={}\n\
+             tab_name_max_chars={}\n",
             self.gpu_acceleration,
             self.preferred_gpu,
             self.max_undo_steps,
@@ -3630,6 +3635,7 @@ impl AppSettings {
             self.create_canvas_on_startup,
             self.confirm_on_exit,
             self.overlay_respects_layer_opacity,
+            self.tab_name_max_chars,
         );
         // Append keybinding lines
         let mut content = content;
@@ -3816,6 +3822,9 @@ impl AppSettings {
                 }
                 "overlay_respects_layer_opacity" => {
                     s.overlay_respects_layer_opacity = val == "true";
+                }
+                "tab_name_max_chars" => {
+                    s.tab_name_max_chars = val.parse().unwrap_or(24u32).clamp(8, 128);
                 }
                 "default_canvas_width" => {
                     s.default_canvas_width = val.parse().unwrap_or(800u32).clamp(1, 65535);
@@ -4482,6 +4491,17 @@ impl SettingsWindow {
         );
         ui.label(
             egui::RichText::new("When enabled, the floating overlay preview reflects the active layer's opacity.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(4.0);
+        ui.label("Tab name max characters (stem only):");
+        ui.add(
+            egui::Slider::new(&mut settings.tab_name_max_chars, 8..=128)
+                .text("chars"),
+        );
+        ui.label(
+            egui::RichText::new("Long file names are truncated as 'abc…xyz.png' in tabs.")
                 .small()
                 .weak(),
         );

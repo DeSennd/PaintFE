@@ -238,6 +238,25 @@ pub struct PaintFEApp {
     close_initial_blank: bool,
 }
 
+/// Truncate a project tab name so the stem is at most `max_chars` characters.
+/// Preserves the file extension; inserts "…" in the middle of an overlong stem.
+fn truncate_tab_name(name: &str, max_chars: usize) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(pos) => (&name[..pos], &name[pos..]),
+        None => (name, ""),
+    };
+    let chars: Vec<char> = stem.chars().collect();
+    if chars.len() <= max_chars {
+        return name.to_string();
+    }
+    let available = max_chars.saturating_sub(1); // 1 for the ellipsis character
+    let prefix_len = available / 2;
+    let suffix_len = available - prefix_len;
+    let prefix: String = chars[..prefix_len].iter().collect();
+    let suffix: String = chars[chars.len() - suffix_len..].iter().collect();
+    format!("{}…{}{}", prefix, suffix, ext)
+}
+
 /// Discover a system CJK font at runtime (for Japanese, Korean, Chinese support).
 /// Returns `(font_name, font_bytes)` if found.
 fn discover_system_cjk_font() -> Option<(String, Vec<u8>)> {
@@ -4442,7 +4461,7 @@ impl eframe::App for PaintFEApp {
                                     };
 
                                     // --- Build tab text ---
-                                    let tab_label = name.clone();
+                                    let tab_label = truncate_tab_name(name, self.settings.tab_name_max_chars as usize);
                                     let text = egui::RichText::new(&tab_label).color(text_color);
                                     let text = if is_active { text.strong() } else { text };
 
