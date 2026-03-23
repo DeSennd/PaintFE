@@ -2988,6 +2988,7 @@ pub struct Canvas {
     pan_offset: Vec2,
     last_filter_was_linear: Option<bool>, // Track last filter state to detect changes
     pub last_canvas_rect: Option<Rect>,
+    pub last_image_rect: Option<Rect>,
     /// Accent color for selection outlines (set from theme).
     pub selection_stroke: Color32,
     /// Faint accent for selection fill overlay (set from theme).
@@ -3041,6 +3042,7 @@ impl Canvas {
             pan_offset: Vec2::ZERO,
             last_filter_was_linear: None,
             last_canvas_rect: None,
+            last_image_rect: None,
             selection_stroke: Color32::from_rgb(66, 133, 244),
             selection_fill: Color32::from_rgba_unmultiplied(66, 133, 244, 50),
             selection_contrast: Color32::WHITE,
@@ -3125,7 +3127,7 @@ impl Canvas {
         &mut self,
         ui: &mut egui::Ui,
         state: &mut CanvasState,
-        tools: Option<&mut crate::components::tools::ToolsPanel>,
+        mut tools: Option<&mut crate::components::tools::ToolsPanel>,
         primary_color_f32: [f32; 4],
         secondary_color_f32: [f32; 4],
         bg_color: Color32,
@@ -3531,6 +3533,7 @@ impl Canvas {
             Pos2::new(temp_rect.min.x.round(), temp_rect.min.y.round()),
             Pos2::new(temp_rect.max.x.round(), temp_rect.max.y.round()),
         );
+        self.last_image_rect = Some(image_rect);
 
         // Fill background with theme color
         painter.rect_filled(canvas_rect, 0.0, bg_color);
@@ -4080,6 +4083,186 @@ impl Canvas {
                         painter.rect_filled(sel_rect, 0.0, fill_color);
                         // Marching ants border
                         self.draw_marching_rect(&painter, sel_rect, anim_time);
+                    }
+                }
+            }
+        }
+
+        // ====================================================================
+        // SELECTION RECT OVERLAY  (resize/move handles for rect/ellipse/lasso
+        //                          select & move-selection tool)
+        // ====================================================================
+        // Shown when a selection tool is active, no paste overlay is up,
+        // and the canvas has a selection mask.
+        if paste_overlay.is_none() {
+            let has_selection = state.selection_mask.is_some();
+            if let Some(ref mut tools_ref) = tools {
+                use crate::components::tools::Tool;
+                let is_sel_tool = matches!(
+                    tools_ref.active_tool,
+                    Tool::RectangleSelect | Tool::EllipseSelect | Tool::Lasso | Tool::MoveSelection
+                );
+                let not_drawing = !tools_ref.selection_state.dragging
+                    && !tools_ref.lasso_state.dragging;
+                if is_sel_tool && not_drawing {
+                    if !has_selection {
+                        // Selection was cleared externally — drop stale overlay.
+                        tools_ref.sel_rect_overlay = None;
+                        tools_ref.sel_lasso_original_crop = None;
+                    } else {
+                        // Auto-create overlay from mask bounds if one doesn't exist yet.
+                        if tools_ref.sel_rect_overlay.is_none() {
+                            if let Some((min_x, min_y, max_x, max_y)) =
+                                state.selection_overlay_bounds
+                            {
+                                tools_ref.sel_rect_overlay = Some(
+                                    crate::ops::clipboard::PasteOverlay::for_selection_rect(
+                                        min_x, min_y, max_x, max_y,
+                                    ),
+                                );
+                                // For lasso: save the original crop so rescales don't compound.
+                                if tools_ref.active_tool == Tool::Lasso {
+                                    if let Some(mask) = &state.selection_mask {
+                                        let w = max_x - min_x + 1;
+                                        let h = max_y - min_y + 1;
+                                        let mut crop = image::GrayImage::new(w, h);
+                                        for y in 0..h {
+                                            for x in 0..w {
+                                                crop.put_pixel(x, y, *mask.get_pixel(min_x + x, min_y + y));
+                                            }
+                                        }
+                                        tools_ref.sel_lasso_original_crop = Some(crop);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ref mut overlay) = tools_ref.sel_rect_overlay {
+                            let is_dark = ui.visuals().dark_mode;
+                            let accent = self.selection_stroke;
+                            overlay.draw(&painter, image_rect, self.zoom, is_dark, accent);
+
+                            let prev_center = overlay.center;
+                            let prev_sx = overlay.scale_x;
+                            let prev_sy = overlay.scale_y;
+                            if overlay.handle_input(ui, image_rect, self.zoom)
+                                && (overlay.center != prev_center
+                                    || overlay.scale_x != prev_sx
+                                    || overlay.scale_y != prev_sy)
+                            {
+                                let scale_changed = overlay.scale_x != prev_sx
+                                    || overlay.scale_y != prev_sy;
+                                // Compute the translation delta regardless.
+                                let dx = (overlay.center.x - prev_center.x).round() as i32;
+                                let dy = (overlay.center.y - prev_center.y).round() as i32;
+                                match tools_ref.active_tool {
+                                    Tool::RectangleSelect | Tool::MoveSelection => {
+                                        // Rect: always apply rectangle bounds.
+                                        let hw = overlay.scale_x / 2.0;
+                                        let hh = overlay.scale_y / 2.0;
+                                        let cw = state.width as f32;
+                                        let ch = state.height as f32;
+                                        let min_x = ((overlay.center.x - hw).max(0.0) as u32)
+                                            .min(state.width.saturating_sub(1));
+                                        let min_y = ((overlay.center.y - hh).max(0.0) as u32)
+                                            .min(state.height.saturating_sub(1));
+                                        let max_x = ((overlay.center.x + hw).min(cw) as u32)
+                                            .min(state.width.saturating_sub(1));
+                                        let max_y = ((overlay.center.y + hh).min(ch) as u32)
+                                            .min(state.height.saturating_sub(1));
+                                        if max_x > min_x && max_y > min_y {
+                                            state.apply_selection_shape(
+                                                &crate::canvas::SelectionShape::Rectangle {
+                                                    min_x, min_y, max_x, max_y,
+                                                },
+                                                crate::canvas::SelectionMode::Replace,
+                                            );
+                                            state.mark_dirty(None);
+                                        }
+                                    }
+                                    Tool::EllipseSelect => {
+                                        if scale_changed {
+                                            // Resize: re-apply ellipse inscribed in new bounding box.
+                                            let rx = (overlay.scale_x / 2.0).max(1.0);
+                                            let ry = (overlay.scale_y / 2.0).max(1.0);
+                                            let cw = state.width as f32;
+                                            let ch = state.height as f32;
+                                            let cx = overlay.center.x.max(0.0).min(cw);
+                                            let cy = overlay.center.y.max(0.0).min(ch);
+                                            state.apply_selection_shape(
+                                                &crate::canvas::SelectionShape::Ellipse {
+                                                    cx, cy, rx, ry,
+                                                },
+                                                crate::canvas::SelectionMode::Replace,
+                                            );
+                                            state.mark_dirty(None);
+                                        } else {
+                                            // Move only — translate the ellipse mask.
+                                            overlay.center.x = prev_center.x + dx as f32;
+                                            overlay.center.y = prev_center.y + dy as f32;
+                                            state.translate_selection(dx, dy);
+                                        }
+                                    }
+                                    Tool::Lasso => {
+                                        if scale_changed {
+                                            // Resize from the original crop; compute it on first use if missing.
+                                            if tools_ref.sel_lasso_original_crop.is_none() {
+                                                if let (Some(mask), Some((bx0, by0, bx1, by1))) =
+                                                    (&state.selection_mask, state.selection_overlay_bounds)
+                                                {
+                                                    let w = bx1 - bx0 + 1; let h = by1 - by0 + 1;
+                                                    let mut crop = image::GrayImage::new(w, h);
+                                                    for y in 0..h { for x in 0..w {
+                                                        crop.put_pixel(x, y, *mask.get_pixel(bx0 + x, by0 + y));
+                                                    }}
+                                                    tools_ref.sel_lasso_original_crop = Some(crop);
+                                                }
+                                            }
+                                            if let Some(original) = &tools_ref.sel_lasso_original_crop {
+                                                let new_w = overlay.scale_x.max(1.0).round() as u32;
+                                                let new_h = overlay.scale_y.max(1.0).round() as u32;
+                                                let scaled = image::imageops::resize(
+                                                    original, new_w, new_h,
+                                                    image::imageops::FilterType::Nearest,
+                                                );
+                                                let new_cx = overlay.center.x.round() as i32;
+                                                let new_cy = overlay.center.y.round() as i32;
+                                                let dst_x0 = new_cx - new_w as i32 / 2;
+                                                let dst_y0 = new_cy - new_h as i32 / 2;
+                                                let cw = state.width;
+                                                let ch = state.height;
+                                                let mut new_mask = image::GrayImage::new(cw, ch);
+                                                for y in 0..new_h {
+                                                    for x in 0..new_w {
+                                                        let v = scaled.get_pixel(x, y).0[0];
+                                                        if v > 0 {
+                                                            let px = dst_x0 + x as i32;
+                                                            let py = dst_y0 + y as i32;
+                                                            if px >= 0 && px < cw as i32
+                                                                && py >= 0 && py < ch as i32
+                                                            {
+                                                                new_mask.put_pixel(px as u32, py as u32, image::Luma([v]));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                state.selection_mask = Some(new_mask);
+                                                state.invalidate_selection_overlay();
+                                                state.mark_dirty(None);
+                                                overlay.center.x = new_cx as f32;
+                                                overlay.center.y = new_cy as f32;
+                                            }
+                                        } else {
+                                            // Move only — translate the mask; keep original crop intact.
+                                            overlay.center.x = prev_center.x + dx as f32;
+                                            overlay.center.y = prev_center.y + dy as f32;
+                                            state.translate_selection(dx, dy);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                 }
             }

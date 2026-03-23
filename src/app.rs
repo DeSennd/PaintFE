@@ -160,6 +160,12 @@ pub struct PaintFEApp {
 
     // True while a MovePixels overlay is active (extraction already pushed to history).
     is_move_pixels_active: bool,
+    // Selection bounds saved before pixel extraction, so we can restore them on return-to-sel.
+    move_pixels_saved_sel_bounds: Option<(u32, u32, u32, u32)>,
+    // Full lasso mask saved before extraction; used to restore the lasso shape on return-to-sel.
+    move_pixels_saved_lasso_mask: Option<image::GrayImage>,
+    // Overlay center at the moment of extraction; used to compute the translation delta.
+    move_pixels_extraction_center: Option<egui::Pos2>,
 
     // Async filter pipeline
     filter_sender: mpsc::Sender<FilterResult>,
@@ -454,6 +460,9 @@ impl PaintFEApp {
             tools_panel_pos: None,
             last_screen_size: (0.0, 0.0),
             is_move_pixels_active: false,
+            move_pixels_saved_sel_bounds: None,
+            move_pixels_saved_lasso_mask: None,
+            move_pixels_extraction_center: None,
             filter_sender,
             filter_receiver,
             pending_filter_jobs: 0,
@@ -1592,9 +1601,16 @@ impl eframe::App for PaintFEApp {
                         } else {
                             (1, 1)
                         };
+                        let actual_dx = dx_dir * step_x;
+                        let actual_dy = dy_dir * step_y;
                         project
                             .canvas_state
-                            .translate_selection(dx_dir * step_x, dy_dir * step_y);
+                            .translate_selection(actual_dx, actual_dy);
+                        // Keep the resize overlay in sync with the nudged position.
+                        if let Some(ref mut ov) = self.tools_panel.sel_rect_overlay {
+                            ov.center.x += actual_dx as f32;
+                            ov.center.y += actual_dy as f32;
+                        }
                     }
                 }
             }
@@ -1820,10 +1836,204 @@ impl eframe::App for PaintFEApp {
             }
         }
 
+        // -- Context-bar "Move Pixels" button: immediate extraction --
+        if self.tools_panel.pending_pixel_extract
+            && self.paste_overlay.is_none()
+            && !modal_open
+        {
+            self.tools_panel.pending_pixel_extract = false;
+            let mut overlay_out: Option<crate::ops::clipboard::PasteOverlay> = None;
+            // Save selection bounds and (for lasso) the full mask before extraction.
+            let saved_bounds = self
+                .active_project()
+                .and_then(|p| p.canvas_state.selection_overlay_bounds);
+            let saved_lasso_mask =
+                if self.tools_panel.active_tool == crate::components::tools::Tool::Lasso {
+                    self.active_project()
+                        .and_then(|p| p.canvas_state.selection_mask.clone())
+                } else {
+                    None
+                };
+            if let Some(project) = self.active_project_mut() {
+                let mut cmd = crate::components::history::SnapshotCommand::new(
+                    "Move Pixels".to_string(),
+                    &project.canvas_state,
+                );
+                if let Some(overlay) =
+                    crate::ops::clipboard::extract_to_overlay(&mut project.canvas_state)
+                {
+                    overlay_out = Some(overlay);
+                    cmd.set_after(&project.canvas_state);
+                    project.history.push(Box::new(cmd));
+                }
+                project.mark_dirty();
+            }
+            if let Some(overlay) = overlay_out {
+                let extraction_center = overlay.center;
+                self.paste_overlay = Some(overlay);
+                self.is_move_pixels_active = true;
+                self.move_pixels_saved_sel_bounds = saved_bounds;
+                self.move_pixels_saved_lasso_mask = saved_lasso_mask;
+                self.move_pixels_extraction_center = Some(extraction_center);
+                // The sel_rect_overlay is no longer relevant while pixels are floating.
+                self.tools_panel.sel_rect_overlay = None;
+            }
+        }
+
+        // -- Context-bar "Modify Selection" button: commit pixels, return to sel mode --
+        if self.tools_panel.pending_return_to_sel && self.is_move_pixels_active {
+            self.tools_panel.pending_return_to_sel = false;
+            self.move_pixels_saved_sel_bounds = None;
+            let active_tool = self.tools_panel.active_tool;
+            let overlay_geom = self.paste_overlay.as_ref().map(|ov| {
+                let hw = ov.source.width() as f32 * ov.scale_x / 2.0;
+                let hh = ov.source.height() as f32 * ov.scale_y / 2.0;
+                (ov.center, hw, hh)
+            });
+            let saved_lasso_mask = self.move_pixels_saved_lasso_mask.take();
+            self.move_pixels_extraction_center = None;
+            self.commit_paste_overlay();
+            let mut lasso_crop_to_save: Option<image::GrayImage> = None;
+            if let Some((center, hw, hh)) = overlay_geom {
+                if let Some(project) = self.active_project_mut() {
+                    let cw = project.canvas_state.width as f32;
+                    let ch = project.canvas_state.height as f32;
+                    use crate::components::tools::Tool;
+
+                    let (lasso_restored, lasso_new_crop) = if active_tool == Tool::Lasso {
+                        if let Some(mask) = saved_lasso_mask {
+                            let mw = mask.width(); let mh = mask.height();
+                            let mut bx0 = mw; let mut by0 = mh;
+                            let mut bx1 = 0u32; let mut by1 = 0u32;
+                            for y in 0..mh { for x in 0..mw {
+                                if mask.get_pixel(x, y).0[0] > 0 {
+                                    bx0 = bx0.min(x); by0 = by0.min(y);
+                                    bx1 = bx1.max(x); by1 = by1.max(y);
+                                }
+                            }}
+                            let restored_crop = if bx0 <= bx1 {
+                                let orig_w = bx1 - bx0 + 1;
+                                let orig_h = by1 - by0 + 1;
+                                let mut base_crop = image::GrayImage::new(orig_w, orig_h);
+                                for y in 0..orig_h { for x in 0..orig_w {
+                                    base_crop.put_pixel(x, y, *mask.get_pixel(bx0 + x, by0 + y));
+                                }}
+                                let new_w = (2.0 * hw).max(1.0).round() as u32;
+                                let new_h = (2.0 * hh).max(1.0).round() as u32;
+                                if new_w != orig_w || new_h != orig_h {
+                                    Some(image::imageops::resize(
+                                        &base_crop, new_w, new_h,
+                                        image::imageops::FilterType::Nearest,
+                                    ))
+                                } else {
+                                    Some(base_crop)
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(ref crop) = restored_crop {
+                                let new_w = crop.width();
+                                let new_h = crop.height();
+                                let cw_u = project.canvas_state.width;
+                                let ch_u = project.canvas_state.height;
+                                let dst_x0 = (center.x.round() as i32) - new_w as i32 / 2;
+                                let dst_y0 = (center.y.round() as i32) - new_h as i32 / 2;
+                                let mut new_mask = image::GrayImage::new(cw_u, ch_u);
+                                for y in 0..new_h {
+                                    for x in 0..new_w {
+                                        let v = crop.get_pixel(x, y).0[0];
+                                        if v > 0 {
+                                            let px = dst_x0 + x as i32;
+                                            let py = dst_y0 + y as i32;
+                                            if px >= 0 && px < cw_u as i32
+                                                && py >= 0 && py < ch_u as i32
+                                            {
+                                                new_mask.put_pixel(px as u32, py as u32, image::Luma([v]));
+                                            }
+                                        }
+                                    }
+                                }
+                                project.canvas_state.selection_mask = Some(new_mask);
+                                project.canvas_state.invalidate_selection_overlay();
+                                project.canvas_state.mark_dirty(None);
+                            }
+                            (true, restored_crop)
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    };
+
+                    lasso_crop_to_save = lasso_new_crop;
+
+                    if !lasso_restored {
+                        let shape = match active_tool {
+                            Tool::EllipseSelect => {
+                                let rx = hw.max(1.0).min(cw / 2.0);
+                                let ry = hh.max(1.0).min(ch / 2.0);
+                                Some(crate::canvas::SelectionShape::Ellipse {
+                                    cx: center.x.max(0.0).min(cw),
+                                    cy: center.y.max(0.0).min(ch),
+                                    rx,
+                                    ry,
+                                })
+                            }
+                            _ => {
+                                let min_x = ((center.x - hw).max(0.0).round() as u32)
+                                    .min(project.canvas_state.width.saturating_sub(1));
+                                let min_y = ((center.y - hh).max(0.0).round() as u32)
+                                    .min(project.canvas_state.height.saturating_sub(1));
+                                let max_x = ((center.x + hw - 1.0).max(0.0).round() as u32)
+                                    .min(project.canvas_state.width.saturating_sub(1));
+                                let max_y = ((center.y + hh - 1.0).max(0.0).round() as u32)
+                                    .min(project.canvas_state.height.saturating_sub(1));
+                                if max_x >= min_x && max_y >= min_y {
+                                    Some(crate::canvas::SelectionShape::Rectangle {
+                                        min_x, min_y, max_x, max_y,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(shape) = shape {
+                            project.canvas_state.apply_selection_shape(
+                                &shape,
+                                crate::canvas::SelectionMode::Replace,
+                            );
+                        }
+                    }
+
+                    // Recreate sel_rect_overlay using the bounding box.
+                    let min_x = ((center.x - hw).max(0.0).round() as u32)
+                        .min(project.canvas_state.width.saturating_sub(1));
+                    let min_y = ((center.y - hh).max(0.0).round() as u32)
+                        .min(project.canvas_state.height.saturating_sub(1));
+                    let max_x = ((center.x + hw - 1.0).max(0.0).round() as u32)
+                        .min(project.canvas_state.width.saturating_sub(1));
+                    let max_y = ((center.y + hh - 1.0).max(0.0).round() as u32)
+                        .min(project.canvas_state.height.saturating_sub(1));
+                    if max_x >= min_x && max_y >= min_y {
+                        self.tools_panel.sel_rect_overlay = Some(
+                            crate::ops::clipboard::PasteOverlay::for_selection_rect(
+                                min_x, min_y, max_x, max_y,
+                            ),
+                        );
+                    }
+                }
+            }
+            self.tools_panel.sel_lasso_original_crop = lasso_crop_to_save;
+        } else {
+            self.tools_panel.pending_return_to_sel = false;
+        }
+
         // -- Move Selection tool: drag to translate the selection mask --
+        // Suppressed when the sel_rect_overlay is active — it handles dragging directly.
         if !modal_open
             && self.tools_panel.active_tool == crate::components::tools::Tool::MoveSelection
             && self.paste_overlay.is_none()
+            && self.tools_panel.sel_rect_overlay.is_none()
         {
             let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
             let primary_down = ctx.input(|i| i.pointer.primary_down());
@@ -4583,7 +4793,18 @@ impl eframe::App for PaintFEApp {
                         ui.set_enabled(has_project);
                         if let Some(ref mut overlay) = self.paste_overlay {
                             // --- Paste overlay context bar ---
-                            crate::signal_widgets::tool_shelf_tag(ui, "PASTE", self.theme.accent);
+                            let tag_label = if self.is_move_pixels_active { "MODIFY PIXELS" } else { "PASTE" };
+                            crate::signal_widgets::tool_shelf_tag(ui, tag_label, self.theme.accent);
+
+                            // Mode toggle when in pixel-move mode
+                            if self.is_move_pixels_active {
+                                ui.add_space(6.0);
+                                if ui.selectable_label(false, "Modify Selection").clicked() {
+                                    self.tools_panel.pending_return_to_sel = true;
+                                }
+                                let _ = ui.selectable_label(true, "Modify Pixels");
+                                ui.separator();
+                            }
                             ui.add_space(6.0);
 
                             // Filter mode
@@ -4641,11 +4862,17 @@ impl eframe::App for PaintFEApp {
                         } else {
                             let ctx_primary = self.colors_panel.get_primary_color();
                             let ctx_secondary = self.colors_panel.get_secondary_color();
+                            let has_sel = self
+                                .active_project()
+                                .map(|p| p.canvas_state.selection_mask.is_some())
+                                .unwrap_or(false);
                             self.tools_panel.show_context_bar(
                                 ui,
                                 &self.assets,
                                 ctx_primary,
                                 ctx_secondary,
+                                self.is_move_pixels_active,
+                                has_sel,
                             );
                         }
                     });
@@ -4698,6 +4925,41 @@ impl eframe::App for PaintFEApp {
                 };
                 painter.add(egui::Shape::mesh(mesh));
 
+                // If a pixel selection is active and the user presses primary
+                // while using any selection tool, commit the pixels — but only
+                // if the click doesn't land on the paste overlay itself (which
+                // would mean the user is just moving/resizing it).
+                {
+                    use crate::components::tools::Tool;
+                    let is_sel_tool = matches!(
+                        self.tools_panel.active_tool,
+                        Tool::RectangleSelect | Tool::EllipseSelect | Tool::Lasso
+                    );
+                    let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                    // Only act on clicks inside the canvas panel (not UI buttons).
+                    let in_canvas = pointer_pos
+                        .and_then(|p| self.canvas.last_canvas_rect.map(|r| r.contains(p)))
+                        .unwrap_or(false);
+                    if self.paste_overlay.is_some()
+                        && self.is_move_pixels_active
+                        && is_sel_tool
+                        && in_canvas
+                        && ui.input(|i| i.pointer.primary_pressed())
+                    {
+                        let click_hits_overlay = self.canvas.last_image_rect
+                            .and_then(|ir| {
+                                pointer_pos.and_then(|sp| {
+                                    self.paste_overlay.as_ref().map(|ov| {
+                                        ov.hit_test(sp, ir, self.canvas.zoom).is_some()
+                                    })
+                                })
+                            })
+                            .unwrap_or(false);
+                        if !click_hits_overlay {
+                            self.commit_paste_overlay();
+                        }
+                    }
+                }
                 if let Some(project) = self.projects.get_mut(self.active_project_index) {
                     let primary_color_f32 = self.colors_panel.get_primary_color_f32();
                     let secondary_color_f32 = self.colors_panel.get_secondary_color_f32();

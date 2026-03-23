@@ -1511,6 +1511,18 @@ pub struct ToolsPanel {
     /// Pending stroke event — processed by app.rs for undo/redo.
     pending_stroke_event: Option<StrokeEvent>,
     pub selection_state: SelectionToolState,
+    /// Resize overlay for a completed rectangle selection.
+    /// Uses PasteOverlay's handle infrastructure with rotation hidden.
+    pub sel_rect_overlay: Option<crate::ops::clipboard::PasteOverlay>,
+    /// Original lasso mask cropped to its bounding box, saved when the overlay is first created.
+    /// Rescales always start from this to avoid compounding nearest-neighbor degradation.
+    pub sel_lasso_original_crop: Option<GrayImage>,
+    /// Set by the context bar "Move Pixels" button — app.rs extracts pixels
+    /// immediately and creates a paste overlay this frame.
+    pub pending_pixel_extract: bool,
+    /// Set by the context bar "Move Selection" button while in pixel mode —
+    /// app.rs commits the paste overlay in place and returns to selection mode.
+    pub pending_return_to_sel: bool,
     pub magic_wand_state: MagicWandState,
     pub fill_state: FillToolState,
     /// Last color picked this frame plus its target swatch; None if color picker not used.
@@ -1580,6 +1592,10 @@ impl Default for ToolsPanel {
             stroke_tracker: StrokeTracker::default(),
             pending_stroke_event: None,
             selection_state: SelectionToolState::default(),
+            sel_rect_overlay: None,
+            sel_lasso_original_crop: None,
+            pending_pixel_extract: false,
+            pending_return_to_sel: false,
             magic_wand_state: MagicWandState::default(),
             fill_state: FillToolState::default(),
             last_picked_color: None,
@@ -2000,13 +2016,12 @@ impl ToolsPanel {
             (Icon::Gradient, Tool::Gradient),
         ];
         // SELECT: Region selection & movement
+        // MovePixels and MoveSelection are context-bar mode toggles, not toolbar tools.
         let select_tools: Vec<(Icon, Tool)> = vec![
             (Icon::RectSelect, Tool::RectangleSelect),
             (Icon::EllipseSelect, Tool::EllipseSelect),
             (Icon::Lasso, Tool::Lasso),
             (Icon::MagicWand, Tool::MagicWand),
-            (Icon::MovePixels, Tool::MovePixels),
-            (Icon::MoveSelection, Tool::MoveSelection),
         ];
         // RETOUCH & WARP: Repair/clone + distort/transform
         let retouch_tools: Vec<(Icon, Tool)> = vec![
@@ -2472,15 +2487,8 @@ impl ToolsPanel {
                     self.change_tool(Tool::EllipseSelect);
                 }
 
-                let is_move_px = self.active_tool == Tool::MovePixels;
-                if assets.icon_selectable(ui, Icon::MovePixels, is_move_px) {
-                    self.change_tool(Tool::MovePixels);
-                }
-
-                let is_move_sel = self.active_tool == Tool::MoveSelection;
-                if assets.icon_selectable(ui, Icon::MoveSelection, is_move_sel) {
-                    self.change_tool(Tool::MoveSelection);
-                }
+                // MovePixels and MoveSelection are now mode toggles in the
+                // context bar rather than standalone toolbar tools.
             });
 
             ui.separator();
@@ -2602,6 +2610,8 @@ impl ToolsPanel {
         assets: &Assets,
         primary_color: Color32,
         secondary_color: Color32,
+        is_pixel_mode: bool,
+        has_selection: bool,
     ) {
         ui.horizontal(|ui| {
             // Tool name tag badge (Signal Grid style)
@@ -2645,13 +2655,27 @@ impl ToolsPanel {
             match self.active_tool {
                 // Already handled above
                 Tool::Brush | Tool::Pencil | Tool::Line | Tool::Eraser => {}
-                Tool::RectangleSelect | Tool::EllipseSelect => {
-                    self.show_selection_options(ui);
+                Tool::RectangleSelect | Tool::EllipseSelect | Tool::Lasso | Tool::MoveSelection => {
+                    // Mode toggle: Modify Selection ↔ Modify Pixels
+                    let has_sel = self.sel_rect_overlay.is_some() || has_selection;
+                    if has_sel || is_pixel_mode {
+                        let mod_sel_resp = ui.selectable_label(!is_pixel_mode, "Modify Selection");
+                        let mod_px_resp = ui.selectable_label(is_pixel_mode, "Modify Pixels");
+                        if mod_sel_resp.clicked() && is_pixel_mode {
+                            self.pending_return_to_sel = true;
+                        }
+                        if mod_px_resp.clicked() && !is_pixel_mode && has_sel {
+                            self.pending_pixel_extract = true;
+                        }
+                        ui.separator();
+                    }
+                    if matches!(self.active_tool, Tool::RectangleSelect | Tool::EllipseSelect) {
+                        self.show_selection_options(ui);
+                    } else if self.active_tool == Tool::Lasso {
+                        self.show_lasso_options(ui);
+                    }
                 }
                 Tool::MovePixels => {
-                    // Hint only — no options
-                }
-                Tool::MoveSelection => {
                     // Hint only — no options
                 }
                 Tool::MagicWand => {
@@ -2662,9 +2686,6 @@ impl ToolsPanel {
                 }
                 Tool::ColorPicker => {
                     // Hint only — no options
-                }
-                Tool::Lasso => {
-                    self.show_lasso_options(ui);
                 }
                 Tool::Zoom => {
                     // Toggle button for zoom direction (touch-friendly)
@@ -5170,6 +5191,7 @@ impl ToolsPanel {
                     self.selection_state.drag_start = None;
                     self.selection_state.drag_end = None;
                     self.selection_state.right_click_drag = false;
+                    self.sel_rect_overlay = None;
                     canvas_state.mark_dirty(None);
                     ui.ctx().request_repaint();
                 }
@@ -5183,25 +5205,41 @@ impl ToolsPanel {
                 //   else       → context bar mode
                 if (is_primary_pressed || is_secondary_pressed)
                     && !self.selection_state.dragging
-                    && let Some(pos_f) = canvas_pos_unclamped
                 {
-                    let pos2 = Pos2::new(pos_f.0, pos_f.1);
-                    self.selection_state.dragging = true;
-                    self.selection_state.drag_start = Some(pos2);
-                    self.selection_state.drag_end = Some(pos2);
-                    self.selection_state.right_click_drag = is_secondary_pressed;
-                    // Determine and lock effective mode
-                    self.selection_state.drag_effective_mode = if is_secondary_pressed {
-                        SelectionMode::Subtract
-                    } else if shift_held && alt_held {
-                        SelectionMode::Intersect
-                    } else if shift_held {
-                        SelectionMode::Add
-                    } else if alt_held {
-                        SelectionMode::Subtract
-                    } else {
-                        self.selection_state.mode
-                    };
+                    // If the sel_rect_overlay handle was clicked, don't start a new
+                    // selection drag — let the overlay consume the press.
+                    let overlay_consumed = is_primary_pressed
+                        && self
+                            .sel_rect_overlay
+                            .as_ref()
+                            .and_then(|ov| ui.input(|i| i.pointer.interact_pos()).map(|sp| {
+                                ov.hit_test(sp, canvas_rect, zoom).is_some()
+                            }))
+                            .unwrap_or(false);
+
+                    if !overlay_consumed
+                        && let Some(pos_f) = canvas_pos_unclamped
+                    {
+                        // Starting a fresh drag — discard any existing overlay.
+                        self.sel_rect_overlay = None;
+
+                        let pos2 = Pos2::new(pos_f.0, pos_f.1);
+                        self.selection_state.dragging = true;
+                        self.selection_state.drag_start = Some(pos2);
+                        self.selection_state.drag_end = Some(pos2);
+                        self.selection_state.right_click_drag = is_secondary_pressed;
+                        self.selection_state.drag_effective_mode = if is_secondary_pressed {
+                            SelectionMode::Subtract
+                        } else if shift_held && alt_held {
+                            SelectionMode::Intersect
+                        } else if shift_held {
+                            SelectionMode::Add
+                        } else if alt_held {
+                            SelectionMode::Subtract
+                        } else {
+                            self.selection_state.mode
+                        };
+                    }
                 }
 
                 let any_button_down = is_primary_down || is_secondary_down;
@@ -5263,10 +5301,25 @@ impl ToolsPanel {
 
                             canvas_state.apply_selection_shape(&shape, effective_mode);
                             canvas_state.mark_dirty(None);
+
+                            // For a Replace-mode rectangle drag, create the resize overlay.
+                            if self.active_tool == Tool::RectangleSelect
+                                && effective_mode == SelectionMode::Replace
+                            {
+                                self.sel_rect_overlay = Some(
+                                    crate::ops::clipboard::PasteOverlay::for_selection_rect(
+                                        min_x, min_y, max_x, max_y,
+                                    ),
+                                );
+                            } else {
+                                // Add/subtract/intersect — discard stale overlay.
+                                self.sel_rect_overlay = None;
+                            }
                         } else {
                             // Tiny click => deselect
                             canvas_state.clear_selection();
                             canvas_state.mark_dirty(None);
+                            self.sel_rect_overlay = None;
                         }
                     }
 
@@ -7990,10 +8043,20 @@ impl ToolsPanel {
                 }
 
                 // Start lasso drag — lock effective mode from modifier keys at drag start
+                let lasso_overlay_consumed = is_primary_pressed
+                    && self
+                        .sel_rect_overlay
+                        .as_ref()
+                        .and_then(|ov| ui.input(|i| i.pointer.interact_pos()).map(|sp| {
+                            ov.hit_test(sp, canvas_rect, zoom).is_some()
+                        }))
+                        .unwrap_or(false);
                 if (is_primary_pressed || is_secondary_pressed)
                     && !self.lasso_state.dragging
+                    && !lasso_overlay_consumed
                     && let Some(pos_f) = canvas_pos_unclamped
                 {
+                    self.sel_rect_overlay = None;
                     self.lasso_state.dragging = true;
                     self.lasso_state.right_click_drag = is_secondary_pressed;
                     self.lasso_state.drag_effective_mode = if is_secondary_pressed {

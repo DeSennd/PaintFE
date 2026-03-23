@@ -361,6 +361,9 @@ pub struct PasteOverlay {
     pub drag_start_anchor: Vec2,
     /// Whether shift is held (lock aspect ratio).
     pub shift_held: bool,
+    /// Whether to draw and interact with the rotation and anchor handles.
+    /// Set to false for the selection-rect resize overlay.
+    pub show_rotation_handle: bool,
 
     // --- Preview cache (avoids re-rendering every frame) ---
     /// Cached pre-scaled source image.
@@ -414,6 +417,7 @@ impl PasteOverlay {
             drag_start_rotation: 0.0,
             drag_start_anchor: Vec2::ZERO,
             shift_held: false,
+            show_rotation_handle: true,
             cached_scaled: None,
             cached_preview: None,
             gpu_texture: None,
@@ -432,6 +436,22 @@ impl PasteOverlay {
     /// Start a paste from an external image.
     pub fn from_image(img: RgbaImage, canvas_w: u32, canvas_h: u32) -> Self {
         Self::new(img, canvas_w, canvas_h)
+    }
+
+    /// Create a selection-rect resize overlay from integer canvas bounds.
+    /// Uses a 1×1 transparent source so scale_x/scale_y represent pixel dimensions.
+    /// The rotation handle is hidden.
+    pub fn for_selection_rect(min_x: u32, min_y: u32, max_x: u32, max_y: u32) -> Self {
+        use image::Rgba;
+        let source = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let w = (max_x as f32 - min_x as f32).max(1.0);
+        let h = (max_y as f32 - min_y as f32).max(1.0);
+        let mut overlay = Self::new(source, 0, 0);
+        overlay.center = Pos2::new(min_x as f32 + w / 2.0, min_y as f32 + h / 2.0);
+        overlay.scale_x = w;
+        overlay.scale_y = h;
+        overlay.show_rotation_handle = false;
+        overlay
     }
 
     /// Start a paste centered at a specific canvas position.
@@ -735,6 +755,10 @@ impl PasteOverlay {
             painter.rect_stroke(r, 2.0, Stroke::new(1.0, handle_border));
         }
 
+        if !self.show_rotation_handle {
+            return;
+        }
+
         // --- Rotation handle: accent stem + glowing circle ---
         let top_mid_screen = screen_mids[0];
         let rotate_distance = 30.0;
@@ -817,32 +841,35 @@ impl PasteOverlay {
     pub fn hit_test(&self, screen_pos: Pos2, image_rect: Rect, zoom: f32) -> Option<HandleKind> {
         let grab_radius = 10.0;
 
-        // Rotation handle.
+        // Edge midpoints are needed for both rotation handle and edge hit-testing.
         let midpoints = self.edge_midpoints_canvas();
-        let top_mid_screen = self.canvas_to_screen(midpoints[0], image_rect, zoom);
-        let center_screen = self.canvas_to_screen(self.center, image_rect, zoom);
-        let dir = if top_mid_screen.distance(center_screen) > 0.1 {
-            let d = Pos2::new(
-                top_mid_screen.x - center_screen.x,
-                top_mid_screen.y - center_screen.y,
-            );
-            let len = (d.x * d.x + d.y * d.y).sqrt();
-            Vec2::new(d.x / len, d.y / len)
-        } else {
-            Vec2::new(0.0, -1.0)
-        };
-        let rotate_pos = Pos2::new(
-            top_mid_screen.x + dir.x * 30.0,
-            top_mid_screen.y + dir.y * 30.0,
-        );
-        if screen_pos.distance(rotate_pos) < grab_radius {
-            return Some(HandleKind::Rotate);
-        }
 
-        // Anchor.
-        let anchor_screen = self.canvas_to_screen(self.anchor_canvas(), image_rect, zoom);
-        if screen_pos.distance(anchor_screen) < grab_radius {
-            return Some(HandleKind::Anchor);
+        // Rotation handle and anchor (only when enabled).
+        if self.show_rotation_handle {
+            let top_mid_screen = self.canvas_to_screen(midpoints[0], image_rect, zoom);
+            let center_screen = self.canvas_to_screen(self.center, image_rect, zoom);
+            let dir = if top_mid_screen.distance(center_screen) > 0.1 {
+                let d = Pos2::new(
+                    top_mid_screen.x - center_screen.x,
+                    top_mid_screen.y - center_screen.y,
+                );
+                let len = (d.x * d.x + d.y * d.y).sqrt();
+                Vec2::new(d.x / len, d.y / len)
+            } else {
+                Vec2::new(0.0, -1.0)
+            };
+            let rotate_pos = Pos2::new(
+                top_mid_screen.x + dir.x * 30.0,
+                top_mid_screen.y + dir.y * 30.0,
+            );
+            if screen_pos.distance(rotate_pos) < grab_radius {
+                return Some(HandleKind::Rotate);
+            }
+
+            let anchor_screen = self.canvas_to_screen(self.anchor_canvas(), image_rect, zoom);
+            if screen_pos.distance(anchor_screen) < grab_radius {
+                return Some(HandleKind::Anchor);
+            }
         }
 
         // Corner handles.
