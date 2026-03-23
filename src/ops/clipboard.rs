@@ -1009,7 +1009,7 @@ impl PasteOverlay {
         let start_w = src_w * start_sx;
         let start_h = src_h * start_sy;
 
-        let (mut new_sx, mut new_sy, offset_x, offset_y) = match handle {
+        let (mut new_sx, mut new_sy, mut offset_x, mut offset_y) = match handle {
             HandleKind::Right => {
                 let new_w = (start_w + local_dx).max(4.0);
                 let sx = new_w / src_w;
@@ -1060,6 +1060,21 @@ impl PasteOverlay {
             let avg = (new_sx / start_sx).max(new_sy / start_sy);
             new_sx = start_sx * avg;
             new_sy = new_sx / aspect;
+
+            // Recompute offsets after aspect lock so the opposite edge stays fixed.
+            let actual_dw = (new_sx - start_sx) * src_w;
+            let actual_dh = (new_sy - start_sy) * src_h;
+            (offset_x, offset_y) = match handle {
+                HandleKind::Right => (actual_dw / 2.0, 0.0),
+                HandleKind::Left => (-actual_dw / 2.0, 0.0),
+                HandleKind::Bottom => (0.0, actual_dh / 2.0),
+                HandleKind::Top => (0.0, -actual_dh / 2.0),
+                HandleKind::TopLeft => (-actual_dw / 2.0, -actual_dh / 2.0),
+                HandleKind::TopRight => (actual_dw / 2.0, -actual_dh / 2.0),
+                HandleKind::BottomLeft => (-actual_dw / 2.0, actual_dh / 2.0),
+                HandleKind::BottomRight => (actual_dw / 2.0, actual_dh / 2.0),
+                _ => (0.0, 0.0),
+            };
         }
 
         self.scale_x = new_sx;
