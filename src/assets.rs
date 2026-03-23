@@ -3081,6 +3081,8 @@ pub struct AppSettings {
     // Behaviour
     /// Show a save-confirmation dialog when the user exits with unsaved projects.
     pub confirm_on_exit: bool,
+    /// Apply the active layer's opacity to the paste/selection overlay preview.
+    pub overlay_respects_layer_opacity: bool,
 
     // --- Advanced Customization (Phase 10) ---
     /// Master toggle — when false, all overrides are ignored.
@@ -3161,6 +3163,7 @@ impl Default for AppSettings {
             create_canvas_on_startup: true,
 
             confirm_on_exit: true,
+            overlay_respects_layer_opacity: true,
 
             // Advanced Customization defaults
             advanced_customization: false,
@@ -3605,7 +3608,8 @@ impl AppSettings {
              default_canvas_width={}\n\
              default_canvas_height={}\n\
              create_canvas_on_startup={}\n\
-             confirm_on_exit={}\n",
+             confirm_on_exit={}\n\
+             overlay_respects_layer_opacity={}\n",
             self.gpu_acceleration,
             self.preferred_gpu,
             self.max_undo_steps,
@@ -3625,6 +3629,7 @@ impl AppSettings {
             self.default_canvas_height,
             self.create_canvas_on_startup,
             self.confirm_on_exit,
+            self.overlay_respects_layer_opacity,
         );
         // Append keybinding lines
         let mut content = content;
@@ -3808,6 +3813,9 @@ impl AppSettings {
                 }
                 "confirm_on_exit" => {
                     s.confirm_on_exit = val == "true";
+                }
+                "overlay_respects_layer_opacity" => {
+                    s.overlay_respects_layer_opacity = val == "true";
                 }
                 "default_canvas_width" => {
                     s.default_canvas_width = val.parse().unwrap_or(800u32).clamp(1, 65535);
@@ -4465,6 +4473,15 @@ impl SettingsWindow {
         );
         ui.label(
             egui::RichText::new("Shows a save prompt when quitting with unsaved projects.")
+                .small()
+                .weak(),
+        );
+        ui.checkbox(
+            &mut settings.overlay_respects_layer_opacity,
+            "Apply layer opacity to paste/selection overlay",
+        );
+        ui.label(
+            egui::RichText::new("When enabled, the floating overlay preview reflects the active layer's opacity.")
                 .small()
                 .weak(),
         );
