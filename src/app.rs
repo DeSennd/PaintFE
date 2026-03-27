@@ -1,4 +1,6 @@
-use crate::assets::{AppSettings, Assets, BindableAction, Icon, PixelGridMode, SettingsWindow};
+use crate::assets::{
+    AppSettings, Assets, BindableAction, Icon, KeyCombo, PixelGridMode, SettingsWindow,
+};
 use crate::canvas::{BlendMode, Canvas, CanvasState, Layer, TiledImage};
 use crate::components::dialogs::{NewFileDialog, SaveFileDialog, SaveFormat, TiffCompression};
 use crate::components::history::{CanvasSnapshot, SingleLayerSnapshotCommand, SnapshotCommand};
@@ -1144,28 +1146,10 @@ impl eframe::App for PaintFEApp {
         {
             let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
             for file in dropped {
-                if let Some(path) = file.path {
-                    let ext = path
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    let supported = matches!(
-                        ext.as_str(),
-                        "png"
-                            | "jpg"
-                            | "jpeg"
-                            | "bmp"
-                            | "gif"
-                            | "webp"
-                            | "tiff"
-                            | "tif"
-                            | "tga"
-                            | "ico"
-                            | "pfe"
-                    );
-                    if supported {
-                        self.open_file_by_path(path, ctx.input(|i| i.time));
-                    }
+                if let Some(path) = file.path
+                    && path.is_file()
+                {
+                    self.open_file_by_path(path, ctx.input(|i| i.time));
                 }
             }
         }
@@ -1249,6 +1233,12 @@ impl eframe::App for PaintFEApp {
         // so egui will NOT forward consumed keys to text widgets.
         // Clone keybindings to avoid borrow conflicts with &mut self methods.
         if !modal_open {
+            self.tools_panel.brush_resize_drag_binding = self
+                .settings
+                .keybindings
+                .get(BindableAction::BrushResizeDragModifier)
+                .cloned()
+                .unwrap_or_else(|| KeyCombo::modifiers_only(false, true, false));
             use crate::assets::BindableAction;
             let ctrl = ctx.input(|i| i.modifiers.command);
             let kb = self.settings.keybindings.clone();
@@ -2641,7 +2631,12 @@ impl eframe::App for PaintFEApp {
                         ui.separator();
                         if self
                             .assets
-                            .menu_item_enabled(ui, Icon::MenuFilePrint, &t!("menu.file.print"), has_project)
+                            .menu_item_enabled(
+                                ui,
+                                Icon::MenuFilePrint,
+                                &t!("menu.file.print"),
+                                has_project,
+                            )
                             .clicked()
                         {
                             if let Some(project) = self.active_project_mut() {
@@ -5134,23 +5129,38 @@ impl eframe::App for PaintFEApp {
         }
 
         // --- Auto-rasterize text layers when destructive tools attempt to paint on them ---
-        if let Some(layer_idx) = self.tools_panel.pending_auto_rasterize.take()
-            && let Some(project) = self.active_project_mut()
-            && layer_idx < project.canvas_state.layers.len()
-            && project.canvas_state.layers[layer_idx].is_text_layer()
-        {
-            // Snapshot before rasterization for undo
-            let mut cmd = crate::components::history::SingleLayerSnapshotCommand::new_for_layer(
-                "Rasterize Text Layer".to_string(),
-                &project.canvas_state,
-                layer_idx,
-            );
-            // Rasterize in place — convert Text→Raster, pixels are already up-to-date
-            project.canvas_state.layers[layer_idx].content = crate::canvas::LayerContent::Raster;
-            // Capture after state
-            cmd.set_after(&project.canvas_state);
-            project.history.push(Box::new(cmd));
-            project.mark_dirty();
+        if let Some(layer_idx) = self.tools_panel.pending_auto_rasterize.take() {
+            let active_idx = self.active_project_index;
+            if active_idx < self.projects.len()
+                && layer_idx < self.projects[active_idx].canvas_state.layers.len()
+                && self.projects[active_idx].canvas_state.layers[layer_idx].is_text_layer()
+            {
+                {
+                    let project = &mut self.projects[active_idx];
+                    // Snapshot before rasterization for undo
+                    let mut cmd =
+                        crate::components::history::SingleLayerSnapshotCommand::new_for_layer(
+                            "Rasterize Text Layer".to_string(),
+                            &project.canvas_state,
+                            layer_idx,
+                        );
+                    // Rasterize in place — convert Text→Raster, pixels are already up-to-date
+                    project.canvas_state.layers[layer_idx].content =
+                        crate::canvas::LayerContent::Raster;
+                    // Clear canvas-level text editing marker for this layer
+                    if project.canvas_state.text_editing_layer == Some(layer_idx) {
+                        project.canvas_state.text_editing_layer = None;
+                        project.canvas_state.clear_preview_state();
+                    }
+                    // Capture after state
+                    cmd.set_after(&project.canvas_state);
+                    project.history.push(Box::new(cmd));
+                    project.mark_dirty();
+                } // `project` borrow ends here — allows split-borrow below
+                // Cancel any stale text editing session (different field from projects)
+                self.tools_panel
+                    .cancel_text_editing(&mut self.projects[active_idx].canvas_state);
+            }
         }
 
         // --- Async Color Removal ---
@@ -9856,6 +9866,20 @@ impl PaintFEApp {
                     &mut project.history,
                 );
 
+                // If the layer being text-edited was rasterized inside show()
+                // (e.g. via right-click → "Rasterize Text Layer"), cancel any
+                // stale text editing state so tools don't remain locked.
+                if project.canvas_state.text_editing_layer.is_some_and(|idx| {
+                    project
+                        .canvas_state
+                        .layers
+                        .get(idx)
+                        .is_some_and(|l| !l.is_text_layer())
+                }) {
+                    self.tools_panel
+                        .cancel_text_editing(&mut project.canvas_state);
+                }
+
                 // Auto-switch tool immediately when layer selection changes
                 // (same frame as click, no 1-frame delay).
                 self.tools_panel
@@ -9928,6 +9952,10 @@ impl PaintFEApp {
                                 &mut project.canvas_state,
                                 &mut project.history,
                             );
+                            // Clean up any active text editing session so the text tool
+                            // does not remain in editing mode on the now-raster layer.
+                            self.tools_panel
+                                .cancel_text_editing(&mut project.canvas_state);
                         }
                     }
                 }
